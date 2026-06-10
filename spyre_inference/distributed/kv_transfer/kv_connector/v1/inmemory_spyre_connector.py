@@ -791,7 +791,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             time.sleep(0.01)
 
         # Reallocate buffers based on remote descriptors
-        # CRITICAL: Must match the actual KV cache block shape [num_kv_heads, block_size, head_dim]
+        # CRITICAL: Must match the producer's registered block layout.
         desc_count = remote_xfer_descs.descCount()
         tensors = []
         recv_dtype = self._nixl_receive_dtype()
@@ -799,7 +799,10 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
         # Get KV cache shape - if not yet registered, infer from descriptor size
         if self._paged_accessor is not None:
-            kv_block_shape = self._paged_accessor.page_shape  # [num_kv_heads, block_size, head_dim]
+            # The producer registers store-resident blocks in heap-block layout
+            # (see _save_kv_bulk -> SpyrePagedKVCacheAccessor.read_block), so the
+            # receive buffers must match: [block_size, num_kv_heads, head_dim].
+            kv_block_shape = self._paged_accessor.block_shape
         elif self._kv_caches:
             first_cache = next(iter(self._kv_caches.values()))
             kv_block_shape = (
@@ -917,19 +920,10 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 key_store_key = StoreKey(req_id, layer_idx, block_id, KVKind.K)
                 value_store_key = StoreKey(req_id, layer_idx, block_id, KVKind.V)
 
-                if self._paged_accessor is not None:
-                    # Received buffers are in page layout
-                    # [num_kv_heads, block_size, head_dim]; the store holds
-                    # heap-block layout [block_size, num_kv_heads, head_dim],
-                    # mirroring SpyrePagedKVCacheAccessor.read_block.
-                    key_block = key_tensor.permute(1, 0, 2).contiguous()
-                    value_block = value_tensor.permute(1, 0, 2).contiguous()
-                else:
-                    key_block = key_tensor
-                    value_block = value_tensor
-
-                self._store.put(key_store_key, key_block)
-                self._store.put(value_store_key, value_block)
+                # Receive buffers are allocated in heap-block layout (the
+                # producer's registered layout), so they are stored directly.
+                self._store.put(key_store_key, key_tensor)
+                self._store.put(value_store_key, value_tensor)
 
                 # Verify what was stored by reading it back
                 if layer_idx == 0 and block_id == block_ids[0]:

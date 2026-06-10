@@ -191,28 +191,24 @@ def test_nixl_receive_path_is_dtype_aware():
     assert "return torch.float32" in helper  # only as the unregistered fallback
 
 
-def test_nixl_receive_stores_heap_block_layout_for_paged():
-    """Paged NIXL receives must be permuted to heap-block layout before put.
+def test_nixl_receive_uses_block_layout_buffers_for_paged():
+    """Paged NIXL receive buffers must match the producer's registered layout.
 
-    Received buffers are page layout [num_kv_heads, block_size, head_dim];
-    the store convention (shared with _save_kv_bulk via
-    SpyrePagedKVCacheAccessor.read_block) is [block_size, num_kv_heads,
-    head_dim]. Storing unpermuted pages makes load_into fail shape copy and
-    every block goes missing.
+    The producer registers store-resident blocks in heap-block layout
+    [block_size, num_kv_heads, head_dim] (from _save_kv_bulk via
+    SpyrePagedKVCacheAccessor.read_block). Receiving into page-shaped
+    buffers and permuting afterwards transposes cell positions and breaks
+    checksums, so the receive shape is block_shape and tensors are stored
+    directly, with no paged-only permute.
     """
     src = (CONNECTOR_DIR / "inmemory_spyre_connector.py").read_text()
     body = src.split("def _load_saved_requests_nixl", 1)[1].split("def _save_request_nixl", 1)[0]
-    assert "key_block = key_tensor.permute(1, 0, 2).contiguous()" in body
-    assert "value_block = value_tensor.permute(1, 0, 2).contiguous()" in body
-    # The permute is gated on the paged accessor; non-paged receives unchanged.
-    assert body.index("if self._paged_accessor is not None:") < body.index(
-        "key_block = key_tensor.permute"
-    )
-    # The raw page-layout tensors are never stored directly.
-    assert "self._store.put(key_store_key, key_tensor)" not in body
-    assert "self._store.put(value_store_key, value_tensor)" not in body
-    assert "self._store.put(key_store_key, key_block)" in body
-    assert "self._store.put(value_store_key, value_block)" in body
+    assert "kv_block_shape = self._paged_accessor.block_shape" in body
+    assert "self._paged_accessor.page_shape" not in body
+    assert "key_tensor.permute" not in body
+    assert "value_tensor.permute" not in body
+    assert "self._store.put(key_store_key, key_tensor)" in body
+    assert "self._store.put(value_store_key, value_tensor)" in body
 
 
 def test_connector_nonblocking_save_does_not_wait_for_client():
