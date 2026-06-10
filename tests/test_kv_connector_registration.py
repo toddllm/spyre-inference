@@ -63,3 +63,47 @@ def test_connector_imports_without_nixl(monkeypatch):
     mod = importlib.import_module(CONNECTOR_MODULE)
     assert mod.NIXL_AVAILABLE is False
     assert hasattr(mod, "InMemorySpyreConnector")
+
+
+def test_build_spyre_kv_store_backend_heap_alias():
+    """`heap` and `host_memory` must both build a HostMemoryKVStoreBackend.
+
+    This is the runtime counterpart to the structure-test guard against the
+    env-default-vs-registry mismatch. `heap` is the compatibility alias; the
+    canonical name is `host_memory`.
+    """
+    from spyre_inference.distributed.kv_transfer.kv_connector.v1.metadata import (
+        HostMemoryKVStoreBackend,
+        build_spyre_kv_store_backend,
+    )
+
+    heap_backend = build_spyre_kv_store_backend("heap")
+    host_memory_backend = build_spyre_kv_store_backend("host_memory")
+    assert isinstance(heap_backend, HostMemoryKVStoreBackend)
+    assert isinstance(host_memory_backend, HostMemoryKVStoreBackend)
+
+
+def test_build_spyre_kv_store_backend_default_env_value():
+    """The current envs.py default for VLLM_SPYRE_KV_STORE_BACKEND must build."""
+    from spyre_inference import envs as envs_spyre
+    from spyre_inference.distributed.kv_transfer.kv_connector.v1.metadata import (
+        HostMemoryKVStoreBackend,
+        build_spyre_kv_store_backend,
+    )
+
+    default = envs_spyre.VLLM_SPYRE_KV_STORE_BACKEND
+    backend = build_spyre_kv_store_backend(default)
+    assert isinstance(backend, HostMemoryKVStoreBackend), (
+        f"default backend {default!r} did not build a HostMemoryKVStoreBackend; "
+        f"got {type(backend).__name__}"
+    )
+
+
+def test_build_spyre_kv_store_backend_invalid_raises():
+    """Invalid backend names must still raise ValueError with the supported list."""
+    from spyre_inference.distributed.kv_transfer.kv_connector.v1.metadata import (
+        build_spyre_kv_store_backend,
+    )
+
+    with pytest.raises(ValueError, match="Unknown Spyre KV store backend"):
+        build_spyre_kv_store_backend("definitely_not_a_real_backend_xyz")
