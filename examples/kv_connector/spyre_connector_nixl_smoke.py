@@ -166,7 +166,14 @@ def expected_checksums(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _make_connector(role_name: str):
-    """Build an InMemorySpyreConnector without a full engine."""
+    """Build an InMemorySpyreConnector without a full engine.
+
+    KVConnectorBase_V1 requires `vllm_config.kv_transfer_config` to be set,
+    so we attach a minimal KVTransferConfig that selects the Spyre connector
+    and a role that mirrors the script role. NIXL is opt-in via the
+    VLLM_SPYRE_ENABLE_NIXL_TRANSFER env var; the in-process roundtrip works
+    with NIXL unset because both halves share `_GLOBAL_STORE`.
+    """
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
     from spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector import (
@@ -174,17 +181,34 @@ def _make_connector(role_name: str):
     )
 
     role = KVConnectorRole.WORKER
+    kv_role = "kv_producer" if role_name == "prefill" else "kv_consumer"
     try:
-        from vllm.config import VllmConfig
+        from vllm.config import KVTransferConfig, VllmConfig
 
-        vllm_config = VllmConfig()
+        kv_cfg = KVTransferConfig(kv_connector="InMemorySpyreConnector", kv_role=kv_role)
+        vllm_config = VllmConfig(kv_transfer_config=kv_cfg)
     except Exception:
-        # Minimal duck-typed config: the connector only reads
-        # cache_config.block_size at construction time.
+        # Minimal duck-typed config: the connector reads cache_config.block_size
+        # and kv_transfer_config.{kv_role,kv_connector} at construction time.
         from types import SimpleNamespace
 
         vllm_config = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=0), kv_transfer_config=None
+            cache_config=SimpleNamespace(block_size=0),
+            kv_transfer_config=SimpleNamespace(
+                kv_role=kv_role,
+                kv_connector="InMemorySpyreConnector",
+                engine_id="smoke-engine",
+                kv_buffer_device="cpu",
+                kv_buffer_size=int(1e9),
+                kv_rank=None,
+                kv_parallel_size=1,
+                kv_ip="127.0.0.1",
+                kv_port=14579,
+                kv_connector_extra_config={},
+                kv_connector_module_path=None,
+                enable_permute_local_kv=False,
+                kv_load_failure_policy="fail",
+            ),
         )
     return InMemorySpyreConnector(vllm_config, role)
 
