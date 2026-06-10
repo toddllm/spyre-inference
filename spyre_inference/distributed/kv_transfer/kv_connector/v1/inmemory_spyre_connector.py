@@ -917,8 +917,19 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 key_store_key = StoreKey(req_id, layer_idx, block_id, KVKind.K)
                 value_store_key = StoreKey(req_id, layer_idx, block_id, KVKind.V)
 
-                self._store.put(key_store_key, key_tensor)
-                self._store.put(value_store_key, value_tensor)
+                if self._paged_accessor is not None:
+                    # Received buffers are in page layout
+                    # [num_kv_heads, block_size, head_dim]; the store holds
+                    # heap-block layout [block_size, num_kv_heads, head_dim],
+                    # mirroring SpyrePagedKVCacheAccessor.read_block.
+                    key_block = key_tensor.permute(1, 0, 2).contiguous()
+                    value_block = value_tensor.permute(1, 0, 2).contiguous()
+                else:
+                    key_block = key_tensor
+                    value_block = value_tensor
+
+                self._store.put(key_store_key, key_block)
+                self._store.put(value_store_key, value_block)
 
                 # Verify what was stored by reading it back
                 if layer_idx == 0 and block_id == block_ids[0]:
