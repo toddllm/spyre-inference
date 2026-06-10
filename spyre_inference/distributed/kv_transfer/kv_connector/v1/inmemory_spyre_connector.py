@@ -592,6 +592,26 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._saved_requests = OrderedDict((record.req_id, record) for record in records)
         return records
 
+    def _nixl_receive_dtype(self) -> torch.dtype:
+        """Dtype for NIXL receive buffers and descriptor-size math.
+
+        Spyre paged pages are fp16, so descriptor byte counts must use the
+        registered cache dtype — fp32 sizing halves the element count and
+        NIXL rejects the transfer with NIXL_ERR_INVALID_PARAM.
+        """
+        if self._paged_accessor is not None:
+            return self._paged_accessor.dtype
+        if self._kv_caches:
+            first_cache = next(iter(self._kv_caches.values()))
+            dtype = getattr(first_cache, "dtype", None)
+            if isinstance(dtype, torch.dtype):
+                return dtype
+        if self._dtype_str.startswith("torch."):
+            dtype = getattr(torch, self._dtype_str.removeprefix("torch."), None)
+            if isinstance(dtype, torch.dtype):
+                return dtype
+        return torch.float32
+
     def _load_saved_requests_nixl(self) -> list[SavedRequestRecord]:
         """Load saved requests via NIXL transfer (consumer/decode side)"""
         # Ensure NIXL agent is initialized (lazy init)
@@ -774,6 +794,8 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         # CRITICAL: Must match the actual KV cache block shape [num_kv_heads, block_size, head_dim]
         desc_count = remote_xfer_descs.descCount()
         tensors = []
+        recv_dtype = self._nixl_receive_dtype()
+        recv_itemsize = recv_dtype.itemsize
 
         # Get KV cache shape - if not yet registered, infer from descriptor size
         if self._paged_accessor is not None:
@@ -790,7 +812,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             # CRITICAL: KV cache format is [block_size, num_kv_heads, head_dim], NOT [num_kv_heads, block_size, head_dim]
             desc = remote_xfer_descs[0]
             desc_len_bytes = desc[1]
-            num_elements = desc_len_bytes // torch.float32.itemsize
+            num_elements = desc_len_bytes // recv_itemsize
             # num_elements = block_size * num_kv_heads * head_dim
             # For granite: 64 * 8 * 128 = 65536
             num_kv_heads = num_elements // (self._block_size * 128)
@@ -807,7 +829,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         for i in range(desc_count):
             desc = remote_xfer_descs[i]
             desc_len_bytes = desc[1]
-            num_elements = desc_len_bytes // torch.float32.itemsize
+            num_elements = desc_len_bytes // recv_itemsize
 
             if num_elements != expected_elements:
                 logger.warning(
@@ -817,8 +839,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                     expected_elements,
                 )
 
-            # Allocate with correct shape
-            tensor = torch.zeros(kv_block_shape, dtype=torch.float32, device="cpu")
+            # Allocate with correct shape and the registered cache dtype so the
+            # byte count matches the producer's registered pages (fp16 on Spyre).
+            tensor = torch.zeros(kv_block_shape, dtype=recv_dtype, device="cpu")
             tensors.append(tensor)
 
         # Re-register with actual buffers

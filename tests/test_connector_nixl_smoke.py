@@ -171,6 +171,26 @@ def test_split_helpers_import_without_vllm():
     assert smoke.split_env is not None
 
 
+def test_nixl_receive_path_is_dtype_aware():
+    """Decode receive buffers must use the registered cache dtype, not fp32.
+
+    fp32 sizing halves the element count for fp16 pages (a 128-byte page is
+    64 fp16 elements, not 32 fp32) and NIXL rejects the transfer with
+    NIXL_ERR_INVALID_PARAM.
+    """
+    src = (CONNECTOR_DIR / "inmemory_spyre_connector.py").read_text()
+    body = src.split("def _load_saved_requests_nixl", 1)[1].split("def _save_request_nixl", 1)[0]
+    assert "torch.float32.itemsize" not in body
+    assert "dtype=torch.float32" not in body
+    assert "recv_dtype = self._nixl_receive_dtype()" in body
+    assert "desc_len_bytes // recv_itemsize" in body
+    assert "torch.zeros(kv_block_shape, dtype=recv_dtype" in body
+
+    helper = src.split("def _nixl_receive_dtype", 1)[1].split("def _load_saved_requests_nixl", 1)[0]
+    assert "self._paged_accessor.dtype" in helper
+    assert "return torch.float32" in helper  # only as the unregistered fallback
+
+
 def test_connector_nonblocking_save_does_not_wait_for_client():
     """Producer must expose pending transfers without a connected client."""
     src = (CONNECTOR_DIR / "inmemory_spyre_connector.py").read_text()
