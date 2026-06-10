@@ -1305,6 +1305,11 @@ class SerializedUDSProcessKVStoreBackend(SpyreKVStoreBackend):
 
 _STORE_BACKEND_TYPES: dict[str, type[SpyreKVStoreBackend]] = {
     "host_memory": HostMemoryKVStoreBackend,
+    # Compatibility alias: VLLM_SPYRE_KV_STORE_BACKEND defaults to "heap"
+    # in envs.py and prior runbooks/scripts use that name. Map it to the
+    # host-memory backend, matching the InMemoryKVStore = HostMemoryKVStoreBackend
+    # alias maintained below.
+    "heap": HostMemoryKVStoreBackend,
     "serialized_host_memory": SerializedHostMemoryKVStoreBackend,
     "serialized_shared_memory": SerializedSharedMemoryKVStoreBackend,
     "serialized_shared_memory_service": SerializedSharedMemoryServiceKVStoreBackend,
