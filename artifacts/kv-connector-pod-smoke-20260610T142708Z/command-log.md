@@ -221,7 +221,135 @@ git rev-parse HEAD                              # ca24124916e7fa40bb15fcde5fe3bd
 git status --short                              # only untracked: artifacts/<RUN_ID>/
 ```
 
-## 11. Cleanup (deferred)
+## 11. Follow-up: KVTransferConfig + class resolution + create_connector
+
+Same pod, same branch staging.
+
+### 11.1 Inventory (nixl, UCX/NIXL libs, connector class shape, KVTransferConfig signature)
+
+```bash
+oc -n aiu-vllm exec "$POD" -- bash -lc '... <inventory script> ...'
+```
+
+Result:
+
+```text
+nixl python module:    spec: None / ModuleNotFoundError: No module named 'nixl'
+libucp/libucs/libnixl/libucm in ldconfig: none
+
+inmemory_spyre_connector.NIXL_AVAILABLE: False
+class MRO: ['InMemorySpyreConnector', 'KVConnectorBase_V1', 'ABC', 'object']
+
+vllm.config.KVTransferConfig params:
+  ['kv_connector', 'engine_id', 'kv_buffer_device', 'kv_buffer_size', 'kv_role',
+   'kv_rank', 'kv_parallel_size', 'kv_ip', 'kv_port', 'kv_connector_extra_config',
+   'kv_connector_module_path', 'enable_permute_local_kv', 'kv_load_failure_policy']
+KVTransferConfig src: vllm/config/kv_transfer.py
+```
+
+### 11.2 KVTransferConfig build smoke (six probes)
+
+Script: written to `/tmp/kv_kvconfig_smoke.py` then `oc cp` into pod and run as `python /tmp/kv_kvconfig_smoke.py`. Six probes:
+1. `register_kv_connector()` and verify registry contains `InMemorySpyreConnector`.
+2. `KVTransferConfig(kv_connector="InMemorySpyreConnector", kv_role="kv_producer")`.
+3. Same with `kv_role="kv_consumer"`.
+4. Same with `kv_role="kv_both"`.
+5. With explicit `kv_connector_module_path="spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector"`.
+6. **Negative control:** `kv_connector="DefinitelyNotARealConnectorXYZ"`.
+
+**Important runtime observation about `oc exec` + python script files.**
+The first attempt ran `python /tmp/kv_kvconfig_smoke.py` after a `cd /home/senuser/work/spyre-inference-kvconn` in the wrapper exec line. It failed with `AttributeError: module 'spyre_inference' has no attribute 'register_kv_connector'`. Cause: `python script.py` sets `sys.path[0]` to the **script's** directory (`/tmp`), not the cwd. So the branch tree is invisible and the image-installed `spyre-inference 0.1.dev79` (which lacks `register_kv_connector`) gets imported. Resolution: export `PYTHONPATH=/home/senuser/work/spyre-inference-kvconn:${PYTHONPATH:-}` before running. **The pytest gate didn't hit this because the branch's pyproject pins `pythonpath = ["."]` for pytest specifically.** Anyone running an ad-hoc `python` (or starting `vllm serve`) needs `PYTHONPATH` (or a real install).
+
+Successful run output (with `PYTHONPATH` set), trimmed:
+
+```text
+=== 1. register connector ===
+INFO ... [__init__.py:69] Registered InMemorySpyreConnector
+InMemorySpyreConnector in registry: True
+
+=== 2/3/4. KVTransferConfig by name (producer/consumer/both) ===
+BUILT producer: KVTransferConfig(kv_connector='InMemorySpyreConnector', engine_id='62d16b...', kv_buffer_device='cpu', kv_buffer_size=1000000000.0, kv_role='kv_producer', kv_rank=None, kv_parallel_size=1, kv_ip='127.0.0.1', kv_port=14579, kv_connector_extra_config={}, kv_connector_module_path=None, enable_permute_local_kv=False, kv_load_failure_policy='fail')
+BUILT consumer: ... kv_role='kv_consumer' ...
+BUILT both:     ... kv_role='kv_both' ...
+
+=== 5. with explicit kv_connector_module_path ===
+BUILT module-path: KVTransferConfig(...
+    kv_connector_module_path='spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector', ...)
+
+=== 6. bogus name ===
+BUILT bogus (unexpected!): KVTransferConfig(kv_connector='DefinitelyNotARealConnectorXYZ', ...)
+
+=== 8. KVConnectorFactory public surface ===
+public methods: ['create_connector', 'get_connector_class', 'get_connector_class_by_name', 'register_connector']
+```
+
+Probe 6 confirms `KVTransferConfig.__init__` does not validate `kv_connector` against the registry; it accepts any string. The actual gate is at class resolution / instantiation (probes in 11.3 / 11.4).
+
+### 11.3 Class-resolution probe (no instantiation)
+
+Script: `/tmp/kv_resolver_probe.py`. Tests `KVConnectorFactory.get_connector_class_by_name(...)` and `KVConnectorFactory.get_connector_class(KVTransferConfig)` for both positive (registered) and negative (unregistered) cases.
+
+```text
+=== get_connector_class_by_name (no-instantiate resolver) ===
+signature: (connector_name: str) -> type[vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1]
+positive: OK class: <class 'spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector.InMemorySpyreConnector'>
+   MRO: ['InMemorySpyreConnector', 'KVConnectorBase_V1', 'ABC', 'object']
+negative ("DefinitelyNotARealConnectorXYZ"): ValueError "Connector '...' is not registered."
+
+=== get_connector_class via KVTransferConfig (production path) ===
+positive: OK class via cfg: <class 'spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector.InMemorySpyreConnector'>
+   same as registry path: True
+negative via cfg: ValueError "Unsupported connector type: DefinitelyNotARealConnectorXYZ"
+
+registered loader: <function KVConnectorFactory.register_connector.<locals>.loader at 0x...>
+loader source file: vllm/distributed/kv_transfer/kv_connector/factory.py
+```
+
+Both positive paths return the branch class file (verified by `__module__` matching `spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector`). Both negative paths error cleanly.
+
+### 11.4 `create_connector` instantiation — heap/host_memory bug found
+
+Script: `/tmp/kv_instantiate_probe.py`. Built a minimal `VllmConfig` over `facebook/opt-125m` with `kv_transfer_config=KVTransferConfig(kv_connector="InMemorySpyreConnector", kv_role="kv_producer")`, then called `KVConnectorFactory.create_connector(vc, "kv_producer")`.
+
+vLLM-side success markers (matching task expectations):
+
+```text
+INFO ... [vllm.py:1293] Turning off hybrid kv cache manager because `--kv-transfer-config` is set.
+INFO ... [factory.py:64] Creating v1 connector with name: InMemorySpyreConnector and engine_id: ...
+WARNING [base.py:189] Initializing KVConnectorBase_V1.
+WARNING [base.py:201] KVConnectorBase_V1 initialized without kv_cache_config.
+```
+
+Then the connector raised:
+
+```text
+ValueError: Unknown Spyre KV store backend 'heap'.
+Supported backends: host_memory, serialized_host_memory, serialized_shared_memory,
+                    serialized_shared_memory_service, serialized_uds_process_store
+```
+
+Trace:
+
+```text
+factory.py:82  return connector_cls(config, role, kv_cache_config)
+inmemory_spyre_connector.py:137  self._store = store if store is not None else get_global_store()
+inmemory_spyre_connector.py:96   _GLOBAL_STORE = _build_configured_store(store_backend_name)
+inmemory_spyre_connector.py:85   return build_spyre_kv_store_backend(backend_name, ...)
+metadata.py:1326                  raise ValueError(...)
+```
+
+Root cause and fix options are detailed in pod-smoke-report.md "Layer 3: create_connector — a real bug found". Summary:
+
+- `spyre_inference/envs.py:28,90` defaults `VLLM_SPYRE_KV_STORE_BACKEND` to `"heap"`.
+- `spyre_inference/distributed/kv_transfer/kv_connector/v1/metadata.py:1306-1312` (`_STORE_BACKEND_TYPES`) does not include `"heap"`.
+- Both files were introduced in the same commit `45aa658`.
+- No tests / probes / examples / docs reference `"heap"` as a backend name; only `envs.py` does (default + comment + comment).
+
+Fix not yet applied — awaiting choice between:
+- (A) Add `"heap"` -> `HostMemoryKVStoreBackend` to `_STORE_BACKEND_TYPES`.
+- (B) Change `envs.py` default from `"heap"` to `"host_memory"` and update the comment.
+
+## 12. Cleanup (deferred)
 
 ```bash
 oc -n aiu-vllm delete pod kvconn-smoke-06101428 --ignore-not-found

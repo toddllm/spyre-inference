@@ -126,6 +126,113 @@ This pass did **not** run:
 
 The first registration gate passing does **not** imply prefill/decode works.
 
+## Follow-up: KVTransferConfig + class resolution + instantiation (2026-06-10, same pod)
+
+After the gate passed, ran the originally-recommended "smallest next test" — single-pod `KVTransferConfig` build smoke — and pushed past it into class resolution and a real `KVConnectorFactory.create_connector(...)` call. Three layers of result.
+
+### Layer 1: `KVTransferConfig` accepts the registered name (and any string)
+
+```text
+=== 2..4: KVTransferConfig by name (kv_producer / kv_consumer / kv_both) ===
+BUILT producer: KVTransferConfig(kv_connector='InMemorySpyreConnector', engine_id=..., kv_buffer_device='cpu',
+                                  kv_buffer_size=1000000000.0, kv_role='kv_producer', ...)
+BUILT consumer: KVTransferConfig(kv_connector='InMemorySpyreConnector', ..., kv_role='kv_consumer', ...)
+BUILT both:     KVTransferConfig(kv_connector='InMemorySpyreConnector', ..., kv_role='kv_both', ...)
+
+=== 5: KVTransferConfig with explicit kv_connector_module_path ===
+BUILT module-path: KVTransferConfig(kv_connector='InMemorySpyreConnector', ...,
+    kv_connector_module_path='spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector', ...)
+
+=== 6: negative control — bogus connector name ===
+BUILT bogus (unexpected!): KVTransferConfig(kv_connector='DefinitelyNotARealConnectorXYZ', ...)
+```
+
+Important nuance: `KVTransferConfig.__init__` does NOT validate `kv_connector` against the registry — even `"DefinitelyNotARealConnectorXYZ"` constructs cleanly. So Layer 1 only proves the dataclass accepts the string, not that vLLM resolves it. Layer 2 is the actual proof.
+
+### Layer 2: `KVConnectorFactory` resolves `InMemorySpyreConnector` to the branch class
+
+`KVConnectorFactory` exposes three relevant entry points: `register_connector`, `get_connector_class_by_name`, `get_connector_class`, `create_connector`. The first three resolve without instantiation — they're the right probes for "is the registry-backed lookup wired up correctly":
+
+```text
+=== get_connector_class_by_name (the no-instantiate resolver) ===
+positive: get_connector_class_by_name("InMemorySpyreConnector")
+  OK class: <class 'spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector.InMemorySpyreConnector'>
+  MRO: ['InMemorySpyreConnector', 'KVConnectorBase_V1', 'ABC', 'object']
+  module: spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector
+
+negative: get_connector_class_by_name("DefinitelyNotARealConnectorXYZ")
+  EXPECTED error: ValueError "Connector 'DefinitelyNotARealConnectorXYZ' is not registered."
+
+=== get_connector_class via KVTransferConfig (the production path) ===
+OK class via cfg: <class 'spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector.InMemorySpyreConnector'>
+module: spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector
+same as registry path: True
+
+negative via cfg: ValueError "Unsupported connector type: DefinitelyNotARealConnectorXYZ"
+```
+
+Five things proved at this layer:
+
+1. By-name lookup returns the branch's actual class object (not a stale alias).
+2. Production-path lookup `get_connector_class(KVTransferConfig)` returns the **same** class.
+3. Returned class extends `KVConnectorBase_V1` correctly.
+4. Negative-name path errors via the by-name resolver (not silently None).
+5. Negative-name path also errors via the cfg resolver (with a different error string — both paths gate, just via different branches).
+
+### Layer 3: `create_connector` — a real bug found
+
+`KVConnectorFactory.create_connector(VllmConfig, role)` actually instantiates the connector. Built a minimal `VllmConfig` over `facebook/opt-125m` (open repo) with the `KVTransferConfig`, then called `create_connector`:
+
+```text
+INFO 06-10 14:42:03 [factory.py:64] Creating v1 connector with name: InMemorySpyreConnector and engine_id: ...
+WARNING 06-10 14:42:03 [base.py:189] Initializing KVConnectorBase_V1. This API is experimental and subject to change in the future as we iterate the design.
+WARNING 06-10 14:42:03 [base.py:201] KVConnectorBase_V1 initialized without kv_cache_config. This is deprecated - please update your connector to accept kv_cache_config as the third constructor argument and pass it to super().__init__().
+Traceback (most recent call last):
+  File ".../vllm/distributed/kv_transfer/kv_connector/factory.py", line 82, in create_connector
+    return connector_cls(config, role, kv_cache_config)
+  File ".../spyre_inference/.../inmemory_spyre_connector.py", line 137, in __init__
+    self._store = store if store is not None else get_global_store()
+  File ".../spyre_inference/.../inmemory_spyre_connector.py", line 96, in get_global_store
+    _GLOBAL_STORE = _build_configured_store(store_backend_name)
+  File ".../spyre_inference/.../inmemory_spyre_connector.py", line 85, in _build_configured_store
+    return build_spyre_kv_store_backend(backend_name, ...)
+  File ".../spyre_inference/.../metadata.py", line 1326, in build_spyre_kv_store_backend
+    raise ValueError(...)
+ValueError: Unknown Spyre KV store backend 'heap'.
+Supported backends: host_memory, serialized_host_memory, serialized_shared_memory,
+                    serialized_shared_memory_service, serialized_uds_process_store
+```
+
+A real bug on the branch. Two files disagree about the canonical name of the in-memory backend:
+
+- `spyre_inference/envs.py:28,90` declares `VLLM_SPYRE_KV_STORE_BACKEND` default as `"heap"` (and the comment at line 89 advertises `"'heap' or 'host_memory'"`).
+- `spyre_inference/distributed/kv_transfer/kv_connector/v1/metadata.py:1306-1312` declares `_STORE_BACKEND_TYPES` with no `"heap"` entry — only `host_memory`, `serialized_host_memory`, `serialized_shared_memory`, `serialized_shared_memory_service`, `serialized_uds_process_store`.
+
+`git log -L` over `VLLM_SPYRE_KV_STORE_BACKEND` shows both files were introduced in the same commit `45aa658` ("Port Spyre KV connector baseline"). So the inconsistency is an internal port mismatch, not historical drift.
+
+The convention in `metadata.py` itself even calls `HostMemoryKVStoreBackend` "InMemoryKVStore" via a backward-compat type alias (`metadata.py:1340`: `InMemoryKVStore = HostMemoryKVStoreBackend`). So the rename `heap`/`InMemory` → `host_memory`/`HostMemory` happened in the metadata layer but the env-var default and the `metadata.py` registry were not aligned.
+
+**Two fix options, both small:**
+
+| | Change | Pros | Cons |
+|---|---|---|---|
+| (A) | Add `"heap": HostMemoryKVStoreBackend` to `_STORE_BACKEND_TYPES`; keep envs.py default at `"heap"` | Backward-compatible if anyone is already setting `VLLM_SPYRE_KV_STORE_BACKEND=heap` | Adds a public alias that wasn't intended; perpetuates the legacy name |
+| (B) | Change envs.py default from `"heap"` to `"host_memory"`; update the comment | Aligns with the canonical name `metadata.py` already advertises in its supported list and error message | Behavior changes if anyone explicitly sets `VLLM_SPYRE_KV_STORE_BACKEND=heap` (none found in tree, only in envs.py itself) |
+
+`grep -nE '"heap"|'\''heap'\''' spyre_inference tests` returned only the three lines in `envs.py` — no test, probe, example, or docs references `"heap"` as a backend name. Either fix is safe re-test-wise.
+
+### Why this matters
+
+This bug means the branch's `tests/test_kv_connector_registration.py` gate passes, but **any production code path that reaches `create_connector` with the connector's default env-var setting will throw `ValueError: Unknown Spyre KV store backend 'heap'`**. Every two-pod prefill/decode smoke would fail at engine init unless `VLLM_SPYRE_KV_STORE_BACKEND` is explicitly exported to a supported value first.
+
+This bug was missed by the structure tests because `test_kv_env_vars_declared_consistently` only checks that env-var names line up between the `TYPE_CHECKING` declarations and the dict, not that **default values** are valid backend names. A useful follow-up structure test would assert that `VLLM_SPYRE_KV_STORE_BACKEND`'s default appears as a key in `_STORE_BACKEND_TYPES`.
+
+### What was NOT (yet) done
+
+- The fix has not been applied to the branch in this report. Awaiting decision between (A) and (B).
+- After the fix is applied, the `create_connector` smoke should be re-run; if it then succeeds, that's a much stronger "next gate" than the original report's recommendation.
+- Even with the fix, the pre-existing gaps for a real two-pod smoke remain: no `nixl` Python module on the image, no UCX/NIXL system libs, no second pod / cross-pod network plumbing.
+
 ## Smallest next test
 
 The smallest credible next gate is a two-pod prefill/decode smoke with the connector wired in. The required pre-step before that is to enumerate the inputs missing on this image, since the runbook's PD/NIXL Integration Requirements table flags several gaps:
