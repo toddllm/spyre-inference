@@ -53,6 +53,9 @@ from spyre_inference.distributed.kv_transfer.kv_connector.v1.heap_kv_accessor im
 from spyre_inference.distributed.kv_transfer.kv_connector.v1.heap_kv_inprocess_client import (
     InProcessHeapKVClient,
 )
+from spyre_inference.distributed.kv_transfer.kv_connector.v1.spyre_paged_kv_accessor import (
+    SpyrePagedKVCacheAccessor,
+)
 
 # NIXL imports for KV cache transfer
 try:
@@ -162,6 +165,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._heap_kv_strict = bool(envs_spyre.VLLM_SPYRE_EXPERIMENTAL_HEAP_KV_STRICT)
         self._heap_kv_client: InProcessHeapKVClient | None = None
         self._heap_kv_init_error: str | None = None
+        self._paged_accessor: SpyrePagedKVCacheAccessor | None = None
 
         # Step 2: Store prompt tokens for file transfer (before request_finished)
         self._pending_prompt_tokens: dict[str, list[int]] = {}
@@ -772,7 +776,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         tensors = []
 
         # Get KV cache shape - if not yet registered, infer from descriptor size
-        if self._kv_caches:
+        if self._paged_accessor is not None:
+            kv_block_shape = self._paged_accessor.page_shape  # [num_kv_heads, block_size, head_dim]
+        elif self._kv_caches:
             first_cache = next(iter(self._kv_caches.values()))
             kv_block_shape = (
                 first_cache.shape[2],
@@ -1089,14 +1095,38 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self._kv_caches = kv_caches
-        if kv_caches:
-            self._num_layers = len(kv_caches)
-            self._layer_names = sorted(kv_caches.keys())
-            first_tensor = next(iter(kv_caches.values()))
-            self._dtype_str = str(first_tensor.dtype)
-            if first_tensor.dim() >= 4:
-                self._num_kv_heads = first_tensor.shape[-2]
-                self._head_dim = first_tensor.shape[-1]
+        if not kv_caches:
+            return
+
+        self._num_layers = len(kv_caches)
+        self._layer_names = sorted(kv_caches.keys())
+
+        # The Spyre attention backend registers SpyrePagedKVCache page lists
+        # (a NamedTuple of k/v page lists), not monolithic staging tensors.
+        self._paged_accessor = SpyrePagedKVCacheAccessor.try_from_kv_caches(kv_caches)
+        if self._paged_accessor is not None:
+            self._num_kv_heads = self._paged_accessor.num_kv_heads
+            self._head_dim = self._paged_accessor.head_dim
+            self._dtype_str = str(self._paged_accessor.dtype)
+            if self._block_size != self._paged_accessor.block_size:
+                logger.warning(
+                    "[InMemorySpyreConnector] Config block_size=%d disagrees with "
+                    "registered page block_size=%d; using page geometry",
+                    self._block_size,
+                    self._paged_accessor.block_size,
+                )
+                self._block_size = self._paged_accessor.block_size
+            logger.info(
+                "[InMemorySpyreConnector] Paged KV cache registered: %s",
+                self._paged_accessor.describe(),
+            )
+            return
+
+        first_tensor = next(iter(kv_caches.values()))
+        self._dtype_str = str(first_tensor.dtype)
+        if first_tensor.dim() >= 4:
+            self._num_kv_heads = first_tensor.shape[-2]
+            self._head_dim = first_tensor.shape[-1]
 
     @property
     def uses_heap_kv(self) -> bool:
@@ -1104,6 +1134,14 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def heap_kv_active(self) -> bool:
         return self._ensure_heap_kv_client() is not None
+
+    def paged_kv_active(self) -> bool:
+        return self._paged_accessor is not None
+
+    def get_paged_kv_status(self) -> dict[str, Any]:
+        if self._paged_accessor is None:
+            return {"active": False}
+        return {"active": True, **self._paged_accessor.describe()}
 
     def get_heap_kv_status(self) -> dict[str, Any]:
         active = self._heap_kv_client is not None
@@ -1117,6 +1155,15 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def _ensure_heap_kv_client(self) -> InProcessHeapKVClient | None:
         if not self._use_heap_kv:
+            return None
+        if self._paged_accessor is not None:
+            # The heap accessor addresses compiled-graph HBM offsets; with
+            # page-list caches the pages are directly accessible tensors and
+            # the heap path is the fallback for older/unknown layouts only.
+            logger.warning_once(
+                "[InMemorySpyreConnector] Heap KV requested but paged KV cache "
+                "is registered; using paged accessor"
+            )
             return None
         if self._heap_kv_client is not None:
             return self._heap_kv_client
@@ -1211,7 +1258,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
         has_load_requests = any(not req_meta.is_store for req_meta in meta.requests)
         heap_client = self._ensure_heap_kv_client() if has_load_requests else None
-        if heap_client is not None:
+        if has_load_requests and self._paged_accessor is not None:
+            total_load, total_miss = self._load_via_paged_accessor(meta, self._paged_accessor)
+        elif heap_client is not None:
             total_load, total_miss = self._load_via_heap_helper(meta, heap_client)
         else:
             for layer_idx, layer_name in enumerate(self._layer_names):
@@ -1489,6 +1538,53 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             heap_client.write_blocks(block_values)
         return load_count, miss_count
 
+    def _load_via_paged_accessor(
+        self,
+        meta: SpyreConnectorMeta,
+        accessor: SpyrePagedKVCacheAccessor,
+    ) -> tuple[int, int]:
+        """Load stored blocks directly into the registered K/V page tensors."""
+        load_count = 0
+        miss_count = 0
+        cpu_block = torch.empty(accessor.block_shape, dtype=accessor.dtype, device="cpu")
+
+        for req_meta in meta.requests:
+            if req_meta.is_store:
+                continue
+
+            source_req = req_meta.source_req_id or req_meta.req_id
+            mapping = (
+                list(req_meta.block_mapping)
+                if req_meta.block_mapping
+                else [(block_id, block_id) for block_id in req_meta.block_ids]
+            )
+
+            for src_block_id, dest_bid in mapping:
+                if not 0 <= dest_bid < accessor.num_pages:
+                    miss_count += 1
+                    self._load_error_block_ids.add(dest_bid)
+                    continue
+                for layer_idx, layer_name in enumerate(accessor.layer_names):
+                    for kv_kind in (KVKind.K, KVKind.V):
+                        store_key = StoreKey(
+                            req_id=source_req,
+                            layer_idx=layer_idx,
+                            block_id=src_block_id,
+                            kv_kind=kv_kind,
+                        )
+                        if self._store.load_into(store_key, cpu_block):
+                            accessor.write_block(
+                                layer_name=layer_name,
+                                kv_kind=kv_kind.value.lower(),
+                                page_id=dest_bid,
+                                values=cpu_block,
+                            )
+                            load_count += 1
+                        else:
+                            miss_count += 1
+                            self._load_error_block_ids.add(dest_bid)
+        return load_count, miss_count
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -1532,12 +1628,21 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 if block_refs:
                     heap_blocks = heap_client.read_blocks(block_refs)
 
+            paged = self._paged_accessor
             for layer_idx, layer_name in enumerate(self._layer_names):
                 staging = self._kv_caches.get(layer_name)
                 if staging is None and not heap_blocks:
                     continue
 
                 for block_id in req_meta.block_ids:
+                    if paged is not None and not 0 <= block_id < paged.num_pages:
+                        logger.warning(
+                            "[InMemorySpyreConnector] save_kv_bulk skipping out-of-range "
+                            "block %d (num_pages=%d)",
+                            block_id,
+                            paged.num_pages,
+                        )
+                        continue
                     for kv_kind, kv_dim in ((KVKind.K, 0), (KVKind.V, 1)):
                         store_key = StoreKey(
                             req_id=req_meta.req_id,
@@ -1547,6 +1652,12 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                         )
                         if heap_blocks:
                             cpu_block = heap_blocks[(layer_idx, kv_kind.value.lower(), block_id)]
+                        elif paged is not None:
+                            cpu_block = paged.read_block(
+                                layer_name=layer_name,
+                                kv_kind=kv_kind.value.lower(),
+                                page_id=block_id,
+                            )
                         else:
                             assert staging is not None
                             cpu_block = staging[kv_dim][block_id]
@@ -1594,9 +1705,10 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                         if staging is None:
                             continue
 
+                        num_blocks = paged.num_pages if paged is not None else staging.shape[1]
                         layer_blocks = []
                         for block_id in req_meta.block_ids:
-                            if block_id < staging.shape[1]:
+                            if block_id < num_blocks:
                                 k_block = staging[0][block_id].cpu().clone()
                                 v_block = staging[1][block_id].cpu().clone()
                                 layer_blocks.append((k_block, v_block))
