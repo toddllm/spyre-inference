@@ -2,10 +2,12 @@
 
 ## Outcome
 
-`implementation_branch_ready` — code is ported, committed on branch
-`tdeshane/spyre-inference-kv-connector-port`, and all local compile, lint,
-and registration-gated tests pass (vLLM-dependent tests skip locally and
-are queued for the cluster image).
+`local_structural_ready_for_pod_smoke` — code is ported and committed on
+branch `tdeshane/spyre-inference-kv-connector-port`, cross-checked against
+vLLM 0.20.1 source (the version pinned by uv.lock), and all local
+non-vLLM checks pass. vLLM is NOT installed locally, so the vLLM-backed
+registration tests were skipped, not executed. The branch is not
+runtime-verified until they pass in a pod image.
 
 ## Source and target
 
@@ -40,10 +42,37 @@ The source repo registered the connector by patching vLLM's `EngineCore`
 before the scheduler builds connectors; `init_device` covers worker
 processes. No vendored vLLM files are modified.
 
+## vLLM 0.20.1 API review (against tag source, see command log)
+
+- Factory `register_connector(name, module_path, class_name)` + lazy loader: matches.
+- `KVConnectorBase_V1.__init__(vllm_config, role, kv_cache_config)`: matches.
+- All 7 abstract methods implemented; `start_load_kv` accepts `**kwargs`;
+  `get_finished`/`request_finished`/`register_kv_caches` signatures match.
+- Optional methods (`handle_preemptions`, `clear_connector_metadata`,
+  `get_kv_connector_kv_cache_events`) have concrete base defaults.
+- Drift fixed: `handle_preemptions(kv_connector_metadata)` — the bridge
+  previously passed preempted req ids (old API). Bridge updated.
+- NIXL: connector imports `nixl._api` directly (guarded); it does not
+  depend on vLLM's relocated `kv_connector/v1/nixl/` package.
+- Timing: scheduler-side connector is created in `Scheduler.__init__`,
+  after `check_and_update_config` runs registration; worker-side caches
+  register via `kv_transfer_group.register_kv_caches` in the model runner,
+  after `init_device` runs registration. Both seams hold for 0.20.1.
+
+## HMA caveat for first smoke
+
+vLLM 0.20.1 auto-disables the hybrid KV cache manager when
+`--kv-transfer-config` is set unless the user explicitly enables it.
+`InMemorySpyreConnector` does not subclass `SupportsHMA`, so the first pod
+smoke must NOT pass `--no-disable-hybrid-kv-cache-manager`; leave HMA
+flags unset and let vLLM disable it.
+
 ## Tests run (exact commands)
 
-- `python3 -m py_compile spyre_inference/.../*.py tests/test_kv_connector_registration.py` — PASS
-- `uvx pytest tests/test_kv_connector_registration.py -q` — 1 skipped (no vLLM locally; module is import-gated)
+- `python3 -m py_compile spyre_inference/.../*.py tests/*.py` — PASS
+- `uvx pytest tests/test_kv_connector_structure.py tests/test_kv_connector_registration.py -v`
+  — 7 passed (structural, no vLLM needed), 1 skipped (registration module
+  gated on vLLM, which is not installed locally — NOT executed)
 - `uvx ruff check <all changed files>` — PASS; `uvx ruff format --check` — PASS
 
 ## Unresolved mappings / assumptions

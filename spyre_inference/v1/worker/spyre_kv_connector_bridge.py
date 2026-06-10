@@ -93,9 +93,11 @@ class SpyreKVConnectorBridge:
         if scheduler_output.kv_connector_metadata is None:
             return False
 
+        # vLLM 0.20.x: handle_preemptions takes the connector metadata,
+        # not the preempted request ids.
         preempted = getattr(scheduler_output, "preempted_req_ids", None)
         if preempted:
-            self._kv_connector.handle_preemptions(preempted)
+            self._kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
 
         self._active = True
         return True

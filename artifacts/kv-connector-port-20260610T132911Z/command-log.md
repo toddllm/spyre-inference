@@ -47,3 +47,25 @@ All commands ran locally on macOS. No cluster or pod commands were run.
   E501 per-file-ignore for ported tree in `pyproject.toml`).
 - Pre-commit-staged scans: `git diff --cached --check` and grep for
   secrets/local paths before commit.
+
+## Follow-up pass (same day): vLLM 0.20.1 API review
+
+- `git clone --depth 1 --branch v0.20.1 --filter=blob:none https://github.com/vllm-project/vllm`
+  to a local cache dir; grepped factory.py, kv_connector/v1/base.py,
+  v1/outputs.py, forward_context.py, v1/core/sched/{scheduler,output}.py,
+  v1/worker/{gpu_model_runner,kv_connector_model_runner_mixin,cpu_model_runner}.py,
+  config/vllm.py.
+- Verified: factory `register_connector(name, module_path, class_name)` and
+  lazy loader; `KVConnectorBase_V1.__init__(vllm_config, role, kv_cache_config)`;
+  all 7 abstract methods implemented with matching signatures; optional
+  methods have base defaults; `KVConnectorOutput` fields used by the bridge
+  exist; scheduler creates the connector in `Scheduler.__init__` (after
+  `check_and_update_config`); worker registers KV caches via
+  `kv_transfer_group.register_kv_caches` in the model runner; HMA
+  auto-disables when `kv_transfer_config` is set unless explicitly enabled.
+- One real drift fixed: `handle_preemptions` now takes connector metadata,
+  not preempted req ids — bridge call updated.
+- New `tests/test_kv_connector_structure.py` (7 tests, no vLLM needed):
+  `uvx pytest tests/test_kv_connector_structure.py tests/test_kv_connector_registration.py -v`
+  → 7 passed, 1 skipped (vLLM not installed locally; registration tests NOT executed).
+- `uvx ruff check/format` clean; `python3 -m py_compile` clean.
