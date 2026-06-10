@@ -40,6 +40,17 @@ for the full implementation report.
   for this connector path, since pages move whole; flash-attention sizing
   (PR 2363) suggests preferring 128-aligned blocks once available.
 
+## Two-process NIXL smoke
+
+`examples/kv_connector/spyre_connector_nixl_smoke.py --nixl` runs split
+prefill/decode processes through the connector NIXL path: the producer
+saves with `VLLM_SPYRE_NIXL_BLOCKING_TRANSFER=0`, exposes the pending
+transfer (`CONNECTOR_NIXL_READY`), and keeps serving LIST/PULL for
+`--keepalive-s`; the consumer pulls via `_load_saved_requests_nixl()`
+(`CONNECTOR_NIXL_PULL_DONE`), then loads pages with `start_load_kv` and
+verifies checksums. The non-blocking `_save_request_nixl` path no longer
+waits for a connected client; only blocking mode does.
+
 ## Smallest next pod smoke test
 
 Two-pod prefill/decode with `VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE=1`,

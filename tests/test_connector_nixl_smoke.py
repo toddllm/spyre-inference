@@ -76,6 +76,112 @@ def test_parser_requires_valid_role():
         smoke.build_parser().parse_args(["--role", "scheduler"])
 
 
+def test_parser_split_mode_flags():
+    args = smoke.build_parser().parse_args(
+        [
+            "--role",
+            "decode",
+            "--nixl",
+            "--prefill-ip",
+            "10.1.2.3",
+            "--prefill-port",
+            "9200",
+            "--listen-port",
+            "9300",
+            "--source-request-id",
+            "req-src",
+            "--request-id",
+            "req-dst",
+            "--timeout-s",
+            "30",
+            "--ready-file",
+            "/tmp/ready.json",
+            "--expected-json",
+            "/tmp/expected.json",
+            "--keepalive-s",
+            "5",
+        ]
+    )
+    assert args.nixl is True
+    assert args.prefill_ip == "10.1.2.3"
+    assert args.prefill_port == 9200
+    assert args.listen_port == 9300
+    assert args.source_request_id == "req-src"
+    assert args.request_id == "req-dst"
+    assert args.timeout_s == 30.0
+    assert args.ready_file == "/tmp/ready.json"
+    assert args.expected_json == "/tmp/expected.json"
+    assert args.keepalive_s == 5.0
+
+    defaults = smoke.build_parser().parse_args(["--role", "both"])
+    assert defaults.nixl is False
+    assert defaults.prefill_port == smoke.DEFAULT_NIXL_PORT
+    assert defaults.listen_port == smoke.DEFAULT_NIXL_PORT
+    assert defaults.source_request_id == smoke.PREFILL_REQ_ID
+    assert defaults.request_id == smoke.DECODE_REQ_ID
+
+
+def test_result_json_aliases_result_file():
+    a = smoke.build_parser().parse_args(["--role", "both", "--result-json", "/tmp/a.json"])
+    b = smoke.build_parser().parse_args(["--role", "both", "--result-file", "/tmp/a.json"])
+    assert a.result_file == b.result_file == "/tmp/a.json"
+
+
+def test_split_env_role_configs():
+    prefill = smoke.build_parser().parse_args(["--role", "prefill", "--nixl"])
+    env = smoke.split_env(prefill)
+    assert env["VLLM_SPYRE_ENABLE_NIXL_TRANSFER"] == "1"
+    assert env["VLLM_SPYRE_KV_ROLE"] == "kv_producer"
+    assert env["VLLM_SPYRE_NIXL_BLOCKING_TRANSFER"] == "0"
+    assert "VLLM_SPYRE_NIXL_REMOTE_IP" not in env
+
+    decode = smoke.build_parser().parse_args(
+        ["--role", "decode", "--nixl", "--prefill-ip", "10.9.8.7"]
+    )
+    env = smoke.split_env(decode)
+    assert env["VLLM_SPYRE_KV_ROLE"] == "kv_consumer"
+    assert env["VLLM_SPYRE_NIXL_REMOTE_IP"] == "10.9.8.7"
+    assert "VLLM_SPYRE_NIXL_BLOCKING_TRANSFER" not in env
+
+
+def test_expected_json_roundtrip(tmp_path):
+    args = smoke.build_parser().parse_args(["--role", "both"])
+    expected = smoke.expected_checksums(args)
+    path = tmp_path / "expected.json"
+    path.write_text(json.dumps(expected))
+    assert smoke.checksums_match(expected, json.loads(path.read_text()))
+
+
+def test_nixl_with_role_both_rejected(tmp_path):
+    result_file = tmp_path / "result.json"
+    rc = smoke.main(["--role", "both", "--nixl", "--result-file", str(result_file)])
+    assert rc == 1
+    result = json.loads(result_file.read_text())
+    assert result["success"] is False
+    assert "split" in result["error"]
+
+
+def test_split_helpers_import_without_vllm():
+    """Split-mode helper logic must not require vLLM at module import time."""
+    src = (REPO / "examples" / "kv_connector" / "spyre_connector_nixl_smoke.py").read_text()
+    top = src.split("def _apply_split_env", 1)[0]
+    assert "import vllm" not in top
+    assert "from vllm" not in top
+    # module already imported above without vLLM
+    assert smoke.split_env is not None
+
+
+def test_connector_nonblocking_save_does_not_wait_for_client():
+    """Producer must expose pending transfers without a connected client."""
+    src = (CONNECTOR_DIR / "inmemory_spyre_connector.py").read_text()
+    body = src.split("def _save_request_nixl", 1)[1].split("def _save_request_record", 1)[0]
+    assert body.count('check_remote_metadata("client")') == 1
+    wait = body.index('check_remote_metadata("client")')
+    blocking_branch = body.index("BLOCKING MODE: wait for the client")
+    assert blocking_branch < wait, "client wait must be inside the blocking-mode branch"
+    assert "_pending_transfers[record.req_id]" in body
+
+
 def test_paged_cache_builder_activates_accessor():
     caches = smoke.build_paged_kv_caches(
         num_layers=2, num_kv_heads=2, block_size=4, head_dim=8, num_pages=4

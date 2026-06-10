@@ -1002,15 +1002,11 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         descs = self._nixl_agent.get_reg_descs(tensors)
         register_descs = self._nixl_agent.register_memory(descs)
 
-        # Wait for client connection
+        import json
         import time
 
-        while not self._nixl_agent.check_remote_metadata("client"):
-            time.sleep(0.01)
-
-        # Send metadata first (req_id, prompt_tokens, block_ids)
-        import json
-
+        # Prepare metadata (req_id, prompt_tokens, block_ids) and descriptors
+        # up front; only blocking mode pushes them to a connected client here.
         metadata = {
             "req_id": record.req_id,
             "prompt_token_ids": list(record.prompt_token_ids),
@@ -1019,21 +1015,20 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             "num_layers": self._num_layers,
         }
         metadata_bytes = json.dumps(metadata).encode("utf-8")
-        self._nixl_agent.send_notif("client", metadata_bytes)
-
-        # Wait for client to acknowledge metadata receipt
-        time.sleep(0.1)
-
-        # Send transfer descriptors
         local_xfer_descs = register_descs.trim()
         desc = self._nixl_agent.get_serialized_descs(local_xfer_descs)
-        self._nixl_agent.send_notif("client", desc)
-
-        # Check if blocking mode is enabled (default=True for backward compatibility)
-        blocking_mode = envs_spyre.VLLM_SPYRE_NIXL_BLOCKING_TRANSFER
 
         if blocking_mode:
-            # BLOCKING MODE: Wait for transfer completion (original behavior)
+            # BLOCKING MODE: wait for the client, push metadata + descriptors,
+            # then wait for transfer completion (original behavior).
+            while not self._nixl_agent.check_remote_metadata("client"):
+                time.sleep(0.01)
+
+            self._nixl_agent.send_notif("client", metadata_bytes)
+            # Give the client a beat to consume metadata before descriptors.
+            time.sleep(0.1)
+            self._nixl_agent.send_notif("client", desc)
+
             logger.info("[InMemorySpyreConnector] NIXL transfer in BLOCKING mode")
             while not self._nixl_agent.check_remote_xfer_done("client", b"KV_TRANSFER"):
                 time.sleep(0.001)
