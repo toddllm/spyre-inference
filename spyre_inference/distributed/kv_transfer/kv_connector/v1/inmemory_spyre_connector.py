@@ -48,10 +48,14 @@ from spyre_inference.distributed.kv_transfer.kv_connector.v1.metadata import (
     build_spyre_kv_store_backend,
 )
 from spyre_inference.distributed.kv_transfer.kv_connector.v1.connector_config import (
+    NIXL_PLUGIN_DIR_ENV,
+    nixl_activation_diagnostic,
     resolve_kv_role,
     resolve_nixl_port,
     resolve_nixl_remote_ip,
     resolve_use_nixl,
+    select_kv_path,
+    select_remote_endpoint,
 )
 from spyre_inference.distributed.kv_transfer.kv_connector.v1.heap_kv_accessor import (
     resolve_heap_kv_paths,
@@ -211,12 +215,25 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._pull_request_handler_stop = False  # Signal to stop thread
 
         if self._use_nixl:
+            # Surface the common activation problem (missing NIXL package or
+            # unset NIXL_PLUGIN_DIR) once, at construction, without exposing
+            # any local paths. NIXL is never imported here; we only inspect a
+            # boolean availability flag and whether the env var is set.
+            diagnostic = nixl_activation_diagnostic(
+                NIXL_AVAILABLE, bool(os.environ.get(NIXL_PLUGIN_DIR_ENV))
+            )
+            if diagnostic is not None:
+                logger.warning("[InMemorySpyreConnector] %s", diagnostic)
             if not NIXL_AVAILABLE:
-                logger.warning("[InMemorySpyreConnector] NIXL requested but not available")
+                # Hard requirement: without the package there is nothing to
+                # transfer over, so fall back to the in-process store path.
                 self._use_nixl = False
             else:
-                # Defer NIXL agent initialization until first use to avoid metadata errors
-                # when remote peer is not yet available
+                # A missing NIXL_PLUGIN_DIR is a soft problem here: the import
+                # succeeded, so keep NIXL enabled and let the first transfer
+                # surface any plugin-load failure. Defer agent initialization
+                # until first use to avoid metadata errors when the remote
+                # peer is not yet available.
                 logger.info(
                     "[InMemorySpyreConnector] NIXL enabled, will initialize on first transfer"
                 )
@@ -1217,12 +1234,9 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
     def get_active_kv_path(self) -> str:
         """Which KV access path is active: 'paged' (main Spyre path),
         'heap' (legacy AIU heap addressing), or 'staging' (legacy
-        monolithic staging tensors)."""
-        if self._paged_accessor is not None:
-            return "paged"
-        if self._use_heap_kv:
-            return "heap"
-        return "staging"
+        monolithic staging tensors). Paged wins whenever real paged caches
+        are registered; heap is an explicit, non-default fallback."""
+        return select_kv_path(self._paged_accessor is not None, self._use_heap_kv)
 
     def get_paged_kv_status(self) -> dict[str, Any]:
         if self._paged_accessor is None:
@@ -1309,33 +1323,53 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         if not isinstance(meta, SpyreConnectorMeta):
             return
 
-        # Extract dynamic remote connection info from metadata (for llm-d routing proxy)
-        # Falls back to environment variable for manual deployments
-        remote_ip = None
-        remote_port = None
-        for req_meta in meta.requests:
-            if not req_meta.is_store and req_meta.remote:
-                remote_ip = req_meta.remote.host
-                remote_port = req_meta.remote.port
-                logger.info(
-                    "[InMemorySpyreConnector] Using dynamic remote connection: host=%s, port=%d (from routing proxy)",
-                    remote_ip,
-                    remote_port,
-                )
-                break
-
-        # Update NIXL remote IP if provided dynamically
-        if remote_ip:
-            self._nixl_remote_ip = remote_ip
+        # Resolve the decode-side remote endpoint from per-request routing
+        # metadata (an llm-d-style proxy populates remote_host/remote_port via
+        # kv_transfer_params), falling back to the env/config endpoint for
+        # manual deployments. Selection is pure and per-batch, so it never
+        # races on shared state while reading the requests.
+        #
+        # Concurrency limitation (documented, not yet lifted): a worker binds
+        # one NIXL client agent to one server for its lifetime. The first
+        # batch that carries an explicit endpoint wins; once _init_nixl_agent
+        # has connected, re-pointing _nixl_remote_ip/_nixl_port has no effect.
+        # Two decode requests routed to different prefill hosts in the same
+        # process therefore cannot be served concurrently. select_remote_endpoint
+        # flags multi-endpoint batches so this shows up in logs instead of
+        # silently pulling every request from one host.
+        load_endpoints = [
+            (req_meta.remote.host, req_meta.remote.port)
+            for req_meta in meta.requests
+            if not req_meta.is_store and req_meta.remote is not None
+        ]
+        endpoint, distinct_endpoints = select_remote_endpoint(
+            load_endpoints, self._nixl_remote_ip, self._nixl_port
+        )
+        if distinct_endpoints > 1:
+            logger.warning(
+                "[InMemorySpyreConnector] Decode batch requested %d distinct remote "
+                "endpoints; this worker serves one remote NIXL endpoint per step and "
+                "will use %s:%d. Concurrent decode requests targeting different prefill "
+                "hosts are not supported in this prototype.",
+                distinct_endpoints,
+                endpoint.host,
+                endpoint.port,
+            )
+        if distinct_endpoints >= 1:
+            self._nixl_remote_ip = endpoint.host
+            self._nixl_port = endpoint.port
             logger.info(
-                "[InMemorySpyreConnector] Updated NIXL remote IP to %s (dynamic from metadata)",
-                self._nixl_remote_ip,
+                "[InMemorySpyreConnector] Using dynamic remote endpoint %s:%d "
+                "(from routing metadata)",
+                endpoint.host,
+                endpoint.port,
             )
         else:
-            # Use environment variable (manual deployment)
+            # Use environment/config endpoint (manual deployment).
             logger.info(
-                "[InMemorySpyreConnector] Using NIXL remote IP from environment: %s",
+                "[InMemorySpyreConnector] Using NIXL remote endpoint from environment: %s:%d",
                 self._nixl_remote_ip,
+                self._nixl_port,
             )
 
         total_load = 0

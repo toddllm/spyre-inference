@@ -42,6 +42,7 @@ vllm serve <model> \
   --kv-transfer-config '{
     "kv_connector": "InMemorySpyreConnector",
     "kv_role": "kv_producer",
+    "kv_connector_module_path": "spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector",
     "kv_connector_extra_config": {"use_nixl": true, "nixl_port": 9100}
   }'
 ```
@@ -55,6 +56,7 @@ vllm serve <model> \
   --kv-transfer-config '{
     "kv_connector": "InMemorySpyreConnector",
     "kv_role": "kv_consumer",
+    "kv_connector_module_path": "spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector",
     "kv_connector_extra_config": {
       "use_nixl": true,
       "nixl_remote_ip": "<producer-host>",
@@ -70,5 +72,5 @@ export VLLM_SPYRE_KV_ROLE=kv_consumer
 export VLLM_SPYRE_ENABLE_NIXL_TRANSFER=1
 export VLLM_SPYRE_NIXL_REMOTE_IP=<producer-host>
 vllm serve <model> \
-  --kv-transfer-config '{"kv_connector":"InMemorySpyreConnector"}'
+  --kv-transfer-config '{"kv_connector":"InMemorySpyreConnector","kv_connector_module_path":"spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector"}'
 ```

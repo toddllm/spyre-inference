@@ -99,6 +99,127 @@ def test_port_extra_config_else_default():
     assert cfg.resolve_nixl_port(None, 9100) == 9100
 
 
+def test_remote_ip_full_precedence_ladder():
+    """One assertion per rung: env > extra_config > kv_transfer_config(kv_ip)
+    > module default."""
+    extra = {"nixl_remote_ip": "extra.host"}
+    # env wins over everything below it.
+    assert cfg.resolve_nixl_remote_ip("env.host", extra, "kvip.host") == "env.host"
+    # no env -> extra_config wins over kv_ip.
+    assert cfg.resolve_nixl_remote_ip(None, extra, "kvip.host") == "extra.host"
+    # no env, no extra -> kv_transfer_config.kv_ip.
+    assert cfg.resolve_nixl_remote_ip(None, {}, "kvip.host") == "kvip.host"
+    # nothing set -> module default.
+    assert cfg.resolve_nixl_remote_ip(None, None, None) == cfg.DEFAULT_NIXL_REMOTE_IP
+
+
+# --- dynamic endpoint routing (pure) ---------------------------------------
+
+
+def test_select_remote_endpoint_no_candidates_uses_fallback():
+    endpoint, distinct = cfg.select_remote_endpoint([], "fallback.host", 9100)
+    assert endpoint == cfg.RemoteEndpoint("fallback.host", 9100)
+    assert distinct == 0
+
+
+def test_select_remote_endpoint_ignores_incomplete_candidates():
+    # Missing host or port is not an explicit endpoint -> fallback.
+    endpoint, distinct = cfg.select_remote_endpoint(
+        [(None, 9100), ("host.only", None), (None, None)], "fallback.host", 9100
+    )
+    assert endpoint == cfg.RemoteEndpoint("fallback.host", 9100)
+    assert distinct == 0
+
+
+def test_select_remote_endpoint_single_explicit():
+    endpoint, distinct = cfg.select_remote_endpoint([("10.0.0.5", 9200)], "fallback.host", 9100)
+    assert endpoint == cfg.RemoteEndpoint("10.0.0.5", 9200)
+    assert distinct == 1
+
+
+def test_select_remote_endpoint_dedupes_identical():
+    endpoint, distinct = cfg.select_remote_endpoint(
+        [("10.0.0.5", 9200), ("10.0.0.5", 9200)], "fallback.host", 9100
+    )
+    assert endpoint == cfg.RemoteEndpoint("10.0.0.5", 9200)
+    assert distinct == 1  # one *distinct* endpoint, no conflict warning
+
+
+def test_select_remote_endpoint_flags_multiple_distinct():
+    endpoint, distinct = cfg.select_remote_endpoint(
+        [("10.0.0.5", 9200), ("10.0.0.6", 9200)], "fallback.host", 9100
+    )
+    assert endpoint == cfg.RemoteEndpoint("10.0.0.5", 9200)  # first wins
+    assert distinct == 2  # caller warns: one remote per worker
+
+
+def test_select_remote_endpoint_coerces_types():
+    # Ports arriving as strings (e.g. from JSON metadata) become ints.
+    endpoint, distinct = cfg.select_remote_endpoint([("10.0.0.5", "9200")], "fb", 9100)
+    assert endpoint == cfg.RemoteEndpoint("10.0.0.5", 9200)
+    assert isinstance(endpoint.port, int)
+    assert distinct == 1
+
+
+# --- KV path selection (pure) ----------------------------------------------
+
+
+def test_select_kv_path_paged_is_primary():
+    # Paged wins whenever real paged caches are registered, even if heap
+    # was explicitly requested.
+    assert cfg.select_kv_path(True, False) == "paged"
+    assert cfg.select_kv_path(True, True) == "paged"
+
+
+def test_select_kv_path_heap_is_explicit_fallback():
+    assert cfg.select_kv_path(False, True) == "heap"
+
+
+def test_select_kv_path_defaults_to_staging():
+    assert cfg.select_kv_path(False, False) == "staging"
+
+
+# --- NIXL activation diagnostic (pure) -------------------------------------
+
+
+def test_nixl_diagnostic_none_when_fully_activated():
+    assert cfg.nixl_activation_diagnostic(True, True) is None
+
+
+def test_nixl_diagnostic_reports_missing_package():
+    msg = cfg.nixl_activation_diagnostic(False, True)
+    assert msg is not None
+    assert "not importable" in msg
+    assert cfg.NIXL_PLUGIN_DIR_ENV in msg  # always names the activation var
+
+
+def test_nixl_diagnostic_reports_missing_plugin_dir():
+    msg = cfg.nixl_activation_diagnostic(True, False)
+    assert msg is not None
+    assert cfg.NIXL_PLUGIN_DIR_ENV in msg
+    assert "plugins will not load" in msg
+
+
+def test_nixl_diagnostic_reports_both_problems():
+    msg = cfg.nixl_activation_diagnostic(False, False)
+    assert msg is not None
+    assert "not importable" in msg
+    assert cfg.NIXL_PLUGIN_DIR_ENV in msg
+
+
+def test_nixl_diagnostic_exposes_no_local_paths():
+    """The message takes booleans only, so it cannot leak path *values*; it
+    names the env var but never an absolute path."""
+    assert cfg.NIXL_PLUGIN_DIR_ENV == "NIXL_PLUGIN_DIR"
+    for msg in (
+        cfg.nixl_activation_diagnostic(False, False),
+        cfg.nixl_activation_diagnostic(True, False),
+        cfg.nixl_activation_diagnostic(False, True),
+    ):
+        assert msg is not None
+        assert "/" not in msg.replace("UCX/NIXL", "")  # no filesystem paths
+
+
 # --- connector wiring (vLLM-gated) -----------------------------------------
 
 

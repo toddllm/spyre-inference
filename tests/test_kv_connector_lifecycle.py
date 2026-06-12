@@ -60,9 +60,38 @@ def test_worker_registers_connector_before_transfer_group_init():
 def test_active_kv_path_reporting_present():
     src = CONNECTOR.read_text()
     assert "def get_active_kv_path" in src
-    assert '"paged"' in src and '"heap"' in src and '"staging"' in src
+    # Path selection is delegated to the pure select_kv_path helper, which
+    # owns the three path-name literals.
+    assert "select_kv_path(" in src
+    cfg = (CONNECTOR.parent / "connector_config.py").read_text()
+    assert '"paged"' in cfg and '"heap"' in cfg and '"staging"' in cfg
     # The legacy fallback announces itself.
     assert "falling back to legacy" in src
+
+
+def test_dynamic_endpoint_selection_is_per_batch_not_global():
+    """Decode endpoint selection must use the pure per-batch helper and not
+    re-introduce the old loop that mutated _nixl_remote_ip from the first
+    remote it saw without flagging conflicts."""
+    src = CONNECTOR.read_text()
+    body = src.split("def start_load_kv", 1)[1].split("def _load_layer", 1)[0]
+    assert "select_remote_endpoint(" in body
+    # Both host and port are applied from the selected endpoint (the old code
+    # captured remote_port but never used it).
+    assert "self._nixl_remote_ip = endpoint.host" in body
+    assert "self._nixl_port = endpoint.port" in body
+    # Multi-endpoint batches are surfaced, documenting the one-remote-per-worker
+    # concurrency limitation instead of silently using the first host.
+    assert "distinct_endpoints > 1" in body
+    assert "not supported in this prototype" in body
+
+
+def test_nixl_activation_diagnostic_wired_at_construction():
+    """The connector must surface the NIXL_PLUGIN_DIR activation hint at
+    construction without importing NIXL."""
+    src = CONNECTOR.read_text()
+    assert "nixl_activation_diagnostic(" in src
+    assert "NIXL_PLUGIN_DIR_ENV" in src
 
 
 def test_decode_list_request_retry_present():
