@@ -56,6 +56,33 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 
 
+class _SpyreAllReduceWork:
+    """Work-like handle returned by ``all_reduce(async_op=True)``.
+
+    Mirrors ``dist.broadcast(async_op=True)``'s Work API:
+    ``work.wait()`` blocks until the two underlying broadcasts complete,
+    applies the in-place add, and returns the reduced tensor.
+    """
+
+    def __init__(self, *, input_, peer, w_self, w_peer):
+        # input_ holds this rank's contribution; receives the sum in wait().
+        # peer is the buffer for the peer's contribution.
+        self._input = input_
+        self._peer = peer
+        self._w_self = w_self
+        self._w_peer = w_peer
+        self._done = False
+
+    def wait(self) -> torch.Tensor:
+        if self._done:
+            return self._input
+        self._w_self.wait()
+        self._w_peer.wait()
+        self._input.add_(self._peer)
+        self._done = True
+        return self._input
+
+
 # libspyre_comms enforces a per-message minimum size (128 bytes). Every
 # TP all_reduce we expect to see in inference is on a hidden-state shard
 # that comfortably exceeds this threshold (hidden_size=1024 float16 =
@@ -92,9 +119,30 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         what's needed to unblock them.
     """
 
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        # World size 1 is a no-op for all_reduce; the base class doesn't
-        # short-circuit here, so do it ourselves.
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        async_op: bool = False,
+    ):
+        """TP=2 all_reduce via two broadcasts.
+
+        Each rank broadcasts its own ``input_`` and receives the peer's
+        broadcast into a scratch buffer. ``dist.broadcast`` on the
+        sender's side is a no-op for the data (``input_`` is unchanged
+        on the sender), so it still holds this rank's contribution and
+        we apply ``input_.add_(peer)`` to produce the sum.
+
+        With ``async_op=False`` (default), behaves like a normal sync
+        allreduce and returns the reduced tensor in place.
+
+        With ``async_op=True``, returns a :class:`_SpyreAllReduceWork`
+        whose ``.wait()`` drains the two underlying broadcasts and
+        applies the add. Multiple ``async_op=True`` calls can be in
+        flight simultaneously; the underlying spyreccl broadcasts
+        pipeline through the per-WorkSchedule fence.
+
+        TP>2 raises until libspyre_comms gains a native allreduce.
+        """
         if self.world_size == 1:
             return input_
 
@@ -110,40 +158,47 @@ class SpyreCommunicator(DeviceCommunicatorBase):
                 )
             )
 
-        # We hand `input_` directly to dist.send/dist.recv, which require
-        # contiguous storage. The base class's dist.all_reduce path has
-        # its own internal handling, but ours doesn't.
+        # dist.broadcast requires contiguous storage.
         assert input_.is_contiguous(), (
             "SpyreCommunicator.all_reduce requires a contiguous input tensor; "
-            f"got tensor with shape={tuple(input_.shape)} stride={input_.stride()}"
+            f"got shape={tuple(input_.shape)} stride={input_.stride()}"
         )
 
-        # TP=2 manual all_reduce.
-        #
-        # We verified on this pod that:
-        #   - dist.send / dist.recv on the spyreccl group work for paired
-        #     ranks at world_size=2.
-        #   - dist.broadcast works on the spyreccl group at any world size.
-        #   - The Spyre comms message matcher requires every p2p message
-        #     to have an immediate matching counterpart across all ranks;
-        #     only world_size=2 trivially satisfies that constraint with a
-        #     single send/recv pair.
-        #
-        # Pattern:
-        #   Rank 1 -> Rank 0 (send/recv).
-        #   Rank 0 sums in place.
-        #   Rank 0 -> all (broadcast).
-        #
-        # REPLACE-WITH-NATIVE: when libspyre_comms gains a native allreduce
-        # and a comms RPM containing it is available, drop this branch.
-        other = 1 - self.rank_in_group
+        # The Spyre comms message matcher pairs broadcasts in issue order
+        # across ranks, so both ranks must agree on issue order:
+        #   1. broadcast with src=ranks[0]   (rank 0 sends, rank 1 recvs)
+        #   2. broadcast with src=ranks[1]   (rank 1 sends, rank 0 recvs)
+        # Replacing the old send/recv + single broadcast pattern with two
+        # broadcasts removes the data dependency between recv and the
+        # following broadcast on rank 0, which previously prevented
+        # multiple in-flight allreduces from pipelining.
+        peer = torch.empty_like(input_)
         if self.rank_in_group == 0:
-            scratch = torch.empty_like(input_)
-            dist.recv(scratch, src=self.ranks[other], group=self.device_group)
-            input_.add_(scratch)
+            w_self = dist.broadcast(
+                input_, src=self.ranks[0],
+                group=self.device_group, async_op=async_op,
+            )
+            w_peer = dist.broadcast(
+                peer, src=self.ranks[1],
+                group=self.device_group, async_op=async_op,
+            )
         else:
-            dist.send(input_, dst=self.ranks[other], group=self.device_group)
-        dist.broadcast(input_, src=self.ranks[0], group=self.device_group)
+            w_peer = dist.broadcast(
+                peer, src=self.ranks[0],
+                group=self.device_group, async_op=async_op,
+            )
+            w_self = dist.broadcast(
+                input_, src=self.ranks[1],
+                group=self.device_group, async_op=async_op,
+            )
+
+        if async_op:
+            return _SpyreAllReduceWork(
+                input_=input_, peer=peer, w_self=w_self, w_peer=w_peer,
+            )
+
+        # Sync path: dist.broadcast already returned, peer is filled.
+        input_.add_(peer)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
